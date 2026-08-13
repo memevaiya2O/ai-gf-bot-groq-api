@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN    = "8929693890:AAFd34iq3zMth6F9fyEkxkB2Xm1kx0l5Bm8"
+BOT_TOKEN    = "8929693890:AAEO19G1oy9YVGUEhv4_ozkw5_iZMEBhKe0"
 GROQ_API_KEY = "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"
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL   = "llama-3.3-70b-versatile"
