@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import time
+import threading
 from datetime import datetime, timedelta
 from collections import defaultdict
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, Message
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes
@@ -59,20 +61,60 @@ def build_system_prompt(user_first: str, user_last: str, username: str) -> str:
 chat_histories: dict[int, list] = defaultdict(list)
 muted_users: dict[int, dict] = {}
 
-BAD_WORDS = [
+BAD_WORDS_SET = {
     "বাল","মাগি","মাগী","বোকাচোদা","চোদা","চোদ","চুদ","চুদি",
     "ভোদা","ভোদাই","গান্ড","গান্ডু","হারামি","হারামজাদা",
     "কুত্তা","রান্ডি","খানকি","বেশ্যা","শুয়োর","শুয়ার",
     "শালা","মাদারচোদ","বাপচোদ","ভাইচোদ","চুতিয়া","কমিনা","নালায়েক",
     "fuck","fucker","fucking","shit","bitch","bastard",
     "asshole","dick","pussy","cunt","whore","slut","motherfucker",
-]
-BAD_WORDS_SET = {w.lower() for w in BAD_WORDS}
+    "মুতা","মুত","হারাম","কুকুর","শুয়ারের বাচ্চা","কুত্তার বাচ্চা",
+    "sala","mc","bc","bkl","mkl","lmao stfu","randi","chut",
+}
 
 
 def has_bad_word(text: str) -> bool:
     t = text.lower()
     return any(w in t for w in BAD_WORDS_SET)
+
+
+def _is_abusive_ai(text: str) -> bool:
+    """Groq দিয়ে AI-based গালি ডিটেকশন — শুধু YES/NO"""
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "তুমি একটি content moderation সিস্টেম। "
+                    "নিচের মেসেজটিতে কোনো গালি, অশ্লীল কথা, বা আপত্তিকর ভাষা আছে কিনা বলো। "
+                    "যেকোনো ভাষায় (বাংলা, ইংরেজি, হিন্দি, romanized বাংলা) হতে পারে। "
+                    "শুধু YES অথবা NO লেখো। অন্য কিছু লেখার দরকার নেই।"
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+        "max_tokens": 5,
+        "temperature": 0,
+    }
+    try:
+        resp = requests.post(GROQ_URL, json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
+        return answer.startswith("YES")
+    except Exception as e:
+        logger.error(f"AI abuse check error: {e}")
+        return False
+
+
+def is_abusive(text: str) -> bool:
+    if has_bad_word(text):
+        return True
+    return _is_abusive_ai(text)
 
 
 def _call_groq_sync(system_prompt: str, messages: list) -> str:
@@ -154,10 +196,14 @@ async def unmute_member(bot, chat_id: int, user_id: int) -> bool:
         await bot.restrict_chat_member(
             chat_id=chat_id, user_id=user_id,
             permissions=ChatPermissions(
-                can_send_messages=True, can_send_media_messages=True,
-                can_send_polls=True, can_send_other_messages=True,
-                can_add_web_page_previews=True, can_change_info=False,
-                can_invite_users=True, can_pin_messages=False,
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_change_info=False,
+                can_invite_users=True,
+                can_pin_messages=False,
             ),
         )
         return True
@@ -167,9 +213,9 @@ async def unmute_member(bot, chat_id: int, user_id: int) -> bool:
 
 
 def get_user_info(user):
-    first  = user.first_name or ""
-    last   = user.last_name  or ""
-    uname  = user.username   or ""
+    first = user.first_name or ""
+    last  = user.last_name  or ""
+    uname = user.username   or ""
     return first, last, uname
 
 
@@ -177,7 +223,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     first, last, uname = get_user_info(user)
     mention = f"@{uname}" if uname else first
-
     await update.message.reply_text(
         f"আরে {mention}! 🥰 এতক্ষণ কোথায় ছিলে?!\n\n"
         f"আমি Fᴀʀɪʜᴀ ♡︎ — রিয়াদের একমাত্র গার্লফ্রেন্ড! 💕\n"
@@ -216,7 +261,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     first, last, uname = get_user_info(user)
 
-    if has_bad_word(text):
+    abuse_detected = await asyncio.to_thread(is_abusive, text)
+
+    if abuse_detected:
         muted = False
         if is_group:
             muted = await mute_member(context.bot, chat.id, user.id)
@@ -236,12 +283,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
 
         keyboard = [[InlineKeyboardButton(
-            "✅ Cancel Warning — Admin Only",
-            callback_data=f"cancel_warn_{user.id}"
+            "✅ Unmute — Admin Only",
+            callback_data=f"cancel_warn_{chat.id}_{user.id}",
         )]]
         await message.reply_text(
             "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
         muted_users[user.id] = {"chat_id": chat.id, "user_name": first}
         return
@@ -265,6 +312,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_cancel_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
+
     chat  = query.message.chat
     admin = query.from_user
 
@@ -273,27 +322,47 @@ async def callback_cancel_warn(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if not await is_admin(chat.id, admin.id, context.bot):
-        await query.answer("❌ শুধু অ্যাডমিনরাই ওয়ার্নিং ক্যান্সেল করতে পারবে!", show_alert=True)
+        await query.answer("❌ শুধু অ্যাডমিনরাই আনমিউট করতে পারবে!", show_alert=True)
         return
 
-    target_id = int(query.data.split("_")[-1])
-    await unmute_member(context.bot, chat.id, target_id)
+    parts     = query.data.split("_")
+    chat_id   = int(parts[2])
+    target_id = int(parts[3])
+
+    success = await unmute_member(context.bot, chat_id, target_id)
     user_name = muted_users.pop(target_id, {}).get("user_name", "ইউজার")
 
-    await query.edit_message_text(
-        f"✅ {user_name} এর ওয়ার্নিং ক্যান্সেল হয়ে গেছে!\n"
-        f"অ্যাডমিন {admin.first_name} আনমিউট করেছেন। 💕"
-    )
-    await query.answer("✅ Warning cancelled!")
+    if success:
+        await query.edit_message_text(
+            f"✅ {user_name}-কে আনমিউট করা হয়েছে!\n"
+            f"অ্যাডমিন {admin.first_name} আনমিউট করেছেন। 💕"
+        )
+    else:
+        await query.edit_message_text(
+            f"⚠️ আনমিউট করতে সমস্যা হয়েছে। বটকে অ্যাডমিন করা আছে কিনা চেক করো।"
+        )
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass
+
+def run_health_server():
+    HTTPServer(("0.0.0.0", 8080), HealthHandler).serve_forever()
 
 
 def main():
     logger.info("Fᴀʀɪʜᴀ ♡︎ bot starting…")
+    threading.Thread(target=run_health_server, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CallbackQueryHandler(callback_cancel_warn, pattern=r"^cancel_warn_\d+$"))
+    app.add_handler(CallbackQueryHandler(callback_cancel_warn, pattern=r"^cancel_warn_-?\d+_\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
